@@ -45,13 +45,10 @@ import logging
 
 from common import (
     LockInfo, LogEntry, LogEntryType, Response, ErrorCode,
-    WatchEvent, WatchEventType, generate_id
+    WatchEvent, WatchEventType, generate_id, LOCK_KEY_PREFIX
 )
 
 logger = logging.getLogger(__name__)
-
-# 锁键的统一前缀
-LOCK_KEY_PREFIX = "/locks/"
 
 
 def make_lock_key(name: str) -> str:
@@ -152,26 +149,84 @@ class LockService:
         - 因为所有节点按相同顺序执行相同日志
         - 只有第一个执行到某个 lock_key 的 ACQUIRE 会成功
         - 后续的都会发现锁已被持有 → 失败
+
+        关键: 锁是真正的 KV 临时节点 (绑定租约)
+        - 锁键会被写入 KV 状态机,绑定 lease_id
+        - 租约过期时 KV 自动删除该键,锁随之释放
         """
         lock_key = entry.key
         lease_id = entry.lease_id
         session_id = entry.session_id
 
-        if lock_key in self._locks:
+        # 先检查 KV 中是否存在锁键 (租约过期或主动释放会删除)
+        # 以及 self._locks 缓存 (加速判断)
+        kv_has_key = False
+        if self._kv:
+            r = self._kv.get(lock_key, check_lease_expired=True)
+            kv_has_key = r.success
+
+        if lock_key in self._locks or kv_has_key:
             # 锁已被持有 → 这次获取失败
+            current_holder = self._locks[lock_key].holder_session if lock_key in self._locks else "unknown"
             logger.debug(
-                f"[锁] 获取失败: {lock_key} 已被 "
-                f"{self._locks[lock_key].holder_session} 持有"
+                f"[锁] 获取失败: {lock_key} 已被 {current_holder} 持有 (KV存在={kv_has_key})"
             )
             self._notify_waiter(lock_key, session_id, Response(
                 ErrorCode.LOCK_EXISTS,
                 f"锁 {lock_key} 已被持有",
                 lock_key=lock_key,
-                current_holder=self._locks[lock_key].holder_session,
+                current_holder=current_holder,
             ))
             return
 
-        # 获取成功
+        # 获取成功: 同时记录到 KV 状态机 (作为带租约的临时节点)
+        # 注意: 这里不通过 Raft 再写日志,因为我们已经在 Raft 日志应用过程中
+        # 直接调用 KV 状态机的内部写入,保证原子性
+        lock_value = {
+            "holder_session": session_id,
+            "lease_id": lease_id,
+            "acquire_revision": entry.index,
+            "acquire_time": entry.timestamp,
+        }
+
+        if self._kv:
+            # 直接写入 KV (走内部 _do_put,绕过 Raft)
+            with self._kv._lock:
+                self._kv._revision += 1
+                rev = self._kv._revision
+                # 因为已经在 apply_entries 中,直接操作内部 _store
+                from common import KVItem
+                if lock_key not in self._kv._store:
+                    self._kv._store[lock_key] = KVItem(
+                        key=lock_key,
+                        value=lock_value,
+                        create_revision=rev,
+                        mod_revision=rev,
+                        version=1,
+                        lease_id=lease_id,
+                    )
+                else:
+                    item = self._kv._store[lock_key]
+                    item.value = lock_value
+                    item.mod_revision = rev
+                    item.lease_id = lease_id
+                    item.version += 1
+
+                # 触发 Watch 回调
+                from common import WatchEvent, WatchEventType
+                event = WatchEvent(
+                    event_type=WatchEventType.PUT,
+                    key=lock_key,
+                    value=lock_value,
+                    revision=rev,
+                    lease_id=lease_id,
+                )
+                for cb in self._kv._change_callbacks:
+                    try:
+                        cb(lock_key, event, rev)
+                    except Exception as e:
+                        logger.error(f"锁获取 KV 回调异常: {e}")
+
         info = LockInfo(
             lock_key=lock_key,
             holder_session=session_id,
@@ -181,7 +236,7 @@ class LockService:
         )
         self._locks[lock_key] = info
 
-        # 记录键租约关联
+        # 记录键租约关联 (LeaseManager)
         if self._lease:
             self._lease.associate_key_to_lease(lease_id, lock_key)
 
@@ -191,7 +246,7 @@ class LockService:
 
         logger.info(
             f"[锁] 已获取: {lock_key}, holder={session_id}, "
-            f"lease={lease_id}, rev={entry.index}"
+            f"lease={lease_id}, rev={entry.index}, KV临时节点已创建"
         )
 
         # 通知等待者 (如果有)
@@ -235,7 +290,7 @@ class LockService:
         self._apply_release_by_key(lock_key, "released")
 
     def _apply_release_by_key(self, lock_key: str, reason: str):
-        """执行释放 (内部调用)"""
+        """执行释放 (内部调用) - 同时从 KV 中删除锁键"""
         info = self._locks.pop(lock_key, None)
         if not info:
             return
@@ -250,9 +305,35 @@ class LockService:
                 info.holder_session, lock_key, info.lease_id
             )
 
+        # 同时从 KV 状态机中删除锁键 (作为带租约临时节点的真正删除)
+        if self._kv and reason != "lease_expired":
+            # 注意: 如果是 lease_expired, KV 已经通过 expire_lease_keys 删除了
+            try:
+                with self._kv._lock:
+                    self._kv._revision += 1
+                    rev = self._kv._revision
+                    if lock_key in self._kv._store:
+                        deleted_item = self._kv._store.pop(lock_key)
+                        # 触发 Watch 回调 (DELETE)
+                        from common import WatchEvent, WatchEventType
+                        event = WatchEvent(
+                            event_type=WatchEventType.DELETE,
+                            key=lock_key,
+                            value=None,
+                            revision=rev,
+                            lease_id=deleted_item.lease_id,
+                        )
+                        for cb in self._kv._change_callbacks:
+                            try:
+                                cb(lock_key, event, rev)
+                            except Exception as e:
+                                logger.error(f"锁释放 KV 回调异常: {e}")
+            except Exception as e:
+                logger.error(f"锁释放时删除 KV 键异常: {e}")
+
         logger.warning(
             f"[锁] 已释放: {lock_key}, 原因={reason}, "
-            f"原 holder={info.holder_session}"
+            f"原 holder={info.holder_session}, KV临时节点已删除"
         )
 
         # 回调

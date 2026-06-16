@@ -24,7 +24,8 @@ import logging
 import re
 
 from common import (
-    KVItem, LogEntry, LogEntryType, WatchEvent, WatchEventType, Response, ErrorCode
+    KVItem, LogEntry, LogEntryType, WatchEvent, WatchEventType, Response, ErrorCode,
+    TxnCompare, TxnCompareOp, TxnOp, TxnOpType, TxnRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ class KVStateMachine:
 
         # 租约相关回调: 状态机需要知道键关联的租约是否过期
         self._lease_check_callback: Optional[Callable[[int], bool]] = None
+
+        # 最近 TXN 执行结果: log_index -> (succeeded, failed_comparison_info)
+        # 节点 txn() 接口在日志应用后通过 log_index 取结果, 避免重新 evaluate
+        self._txn_results: "OrderedDict[int, Tuple[bool, Dict[str, Any]]]" = OrderedDict()
+        self._max_txn_results = 500
 
     # ======== 回调注册 ========
 
@@ -116,6 +122,110 @@ class KVStateMachine:
                 ]
                 for k in keys_to_delete:
                     self._do_delete(k, rev)
+
+            elif entry.entry_type == LogEntryType.TXN_COMMIT:
+                # 事务提交: comparisons → success_ops / failure_ops
+                txn_req = TxnRequest.from_dict(entry.data.get("txn", {}))
+                self._do_txn(txn_req, rev, entry.index)
+
+    # ======== 事务: Compare-And-Swap 核心 ========
+
+    def evaluate_txn(self, txn: TxnRequest) -> Tuple[bool, Dict[str, Any]]:
+        """
+        仅评估事务是否满足条件 (不执行前检查, 不修改状态, 供 Leader 在提交前本地检查
+
+        返回: (succeeded, info)
+            succeeded: 所有 comparisons 是否为 True
+            info: 调试信息
+        """
+        with self._lock:
+            return self._eval_comparisons(txn.comparisons)
+
+    def _eval_comparisons(self, comparisons: List[TxnCompare]) -> Tuple[bool, Dict[str, Any]]:
+        """评估条件比较 (必须在锁内)"""
+        info = {"failed_comparison": None, "succeeded": True}
+        for i, cmp in enumerate(comparisons):
+            ok = self._eval_single_compare(cmp)
+            if not ok:
+                info["succeeded"] = False
+                info["failed_comparison"] = {
+                    "index": i,
+                    "key": cmp.key,
+                    "op": cmp.op.value,
+                    "expected": cmp.value,
+                }
+                return False, info
+        return True, info
+
+    def _eval_single_compare(self, cmp: TxnCompare) -> bool:
+        """评估单个比较条件 (必须在锁内)"""
+        key = cmp.key
+        item = self._store.get(key)
+        exists = item is not None
+        # 检查租约有效性
+        lease_ok = True
+        if exists and item.lease_id > 0 and self._lease_check_callback:
+            lease_ok = self._lease_check_callback(item.lease_id)
+
+        op = cmp.op
+        if op == TxnCompareOp.KEY_EXISTS:
+            return exists and lease_ok
+        if op == TxnCompareOp.KEY_NOT_EXISTS:
+            return not (exists and lease_ok)
+        if not exists:
+            # 以下比较需要键存在才有可能为 True
+            return False
+        if op == TxnCompareOp.VERSION_EQUAL:
+            return item.version == cmp.value
+        if op == TxnCompareOp.VERSION_NOT_EQUAL:
+            return item.version != cmp.value
+        if op == TxnCompareOp.MOD_REVISION_EQUAL:
+            return item.mod_revision == cmp.value
+        if op == TxnCompareOp.CREATE_REVISION_EQUAL:
+            return item.create_revision == cmp.value
+        if op == TxnCompareOp.VALUE_EQUAL:
+            return item.value == cmp.value
+        if op == TxnCompareOp.VALUE_NOT_EQUAL:
+            return item.value != cmp.value
+        if op == TxnCompareOp.LEASE_VALID:
+            return item.lease_id == cmp.value and lease_ok
+        return False
+
+    def _do_txn(self, txn: TxnRequest, revision: int, log_index: int):
+        """执行事务: 先评估条件, 然后执行对应分支 (必须在锁内)"""
+        succeeded, info = self._eval_comparisons(txn.comparisons)
+        ops_to_exec = txn.success_ops if succeeded else txn.failure_ops
+        results = []
+        for op in ops_to_exec:
+            result = self._exec_single_op(op, revision, log_index)
+            results.append(result)
+        # 缓存结果供 txn() 接口查询
+        self._txn_results[log_index] = (succeeded, info)
+        if len(self._txn_results) > self._max_txn_results:
+            self._txn_results.popitem(last=False)
+        logger.info(
+            f"[状态机] 事务执行(log_index={log_index}): succeeded={succeeded}, "
+            f"执行了 {len(ops_to_exec)} 个操作"
+        )
+        return succeeded, results
+
+    def get_txn_result(self, log_index: int) -> Optional[Tuple[bool, Dict[str, Any]]]:
+        """查询指定 log_index 的事务执行结果"""
+        with self._lock:
+            return self._txn_results.get(log_index)
+
+    def _exec_single_op(self, op: TxnOp, revision: int, log_index: int) -> Dict[str, Any]:
+        """执行单个事务操作 (必须在锁内)"""
+        if op.op_type == TxnOpType.PUT:
+            self._do_put(op.key, op.value, op.lease_id, revision, log_index)
+            return {"op": "put", "key": op.key, "value": op.value, "success": True}
+        elif op.op_type == TxnOpType.DELETE:
+            self._do_delete(op.key, revision)
+            return {"op": "delete", "key": op.key, "success": True}
+        elif op.op_type == TxnOpType.GET:
+            item = self._store.get(op.key)
+            return {"op": "get", "key": op.key, "value": item.value if item else None, "success": item is not None}
+        return {"op": op.op_type.value, "success": False}
 
     # ======== 内部操作 ========
 

@@ -25,7 +25,8 @@ import time
 import logging
 
 from common import (
-    LogEntry, LogEntryType, Response, ErrorCode, WatchEventType,
+    LogEntry, LogEntryType, Response, ErrorCode, WatchEventType, LOCK_KEY_PREFIX,
+    TxnRequest, TxnCompare, TxnCompareOp, TxnOp, TxnOpType,
     generate_id
 )
 from consensus import ConsensusModule, RaftConfig
@@ -162,8 +163,21 @@ class Node:
     # ======== 内部: 变更回调 ========
 
     def _on_kv_change(self, key: str, event, revision: int):
-        """KV 变更 → 推送给 WatchManager"""
+        """
+        KV 变更回调:
+        1. 推送给 WatchManager
+        2. 如果是锁键被删除 (租约过期/释放) → 通知 LockService 释放锁
+        """
+        # 先推送给 Watch
         self.watch_mgr.on_state_change(key, event, revision)
+
+        # 锁键删除 → 释放锁 (租约过期或主动删除都会触发)
+        from common import WatchEventType, LOCK_KEY_PREFIX
+        if key.startswith(LOCK_KEY_PREFIX):
+            if event.event_type in (WatchEventType.DELETE, WatchEventType.EXPIRE, WatchEventType.LEASE_REVOKED):
+                # 检查是否仍被锁服务持有 (避免重复释放)
+                if key in self.lock_svc._locks:
+                    self.lock_svc._apply_release_by_key(key, "lease_expired")
 
     def _on_leader_change(self, node_id: str, new_role):
         logger.warning(
@@ -272,6 +286,10 @@ class Node:
         if resp.success:
             self._stats["kv_put_count"] += 1
             resp.data["revision"] = self.kv.revision
+            # 回读写入后的 item
+            gr = self.kv_get(key)
+            if gr.success:
+                resp.data["item"] = gr.data.get("item")
         return resp
 
     def kv_delete(self, key: str) -> Response:
@@ -308,6 +326,111 @@ class Node:
     def kv_get_all(self) -> Response:
         """获取所有键"""
         return self.kv.get_all()
+
+    # ================================================================
+    # 对外 API: 事务 (Compare-And-Swap)
+    # ================================================================
+
+    def txn(self, txn_request: TxnRequest) -> Response:
+        """
+        执行事务: IF (所有 comparisons) THEN success_ops ELSE failure_ops
+
+        所有操作原子执行, 中间不会被其他写穿插 (Raft 保证)
+        返回: succeeded=True 表示条件满足, 执行了 success_ops
+        """
+        if not self.consensus.is_leader():
+            leader_id = self.consensus.get_leader_id()
+            if leader_id and leader_id != self.node_id and leader_id in self._peer_nodes:
+                return self._peer_nodes[leader_id].txn(txn_request)
+            return Response(ErrorCode.NOT_LEADER, "当前节点不是 Leader", leader_id=leader_id)
+
+        # 本地先评估 (快速失败, 避免不必要的 Raft 提交)
+        precheck_succeeded, precheck_info = self.kv.evaluate_txn(txn_request)
+
+        # 提交事务日志到 Raft
+        resp = self._submit_write(
+            LogEntryType.TXN_COMMIT,
+            key="",
+            timestamp=time.time(),
+            data={"txn": txn_request.to_dict(), "precheck_succeeded": precheck_succeeded},
+        )
+
+        if not resp.success:
+            return resp
+
+        log_index = resp.data.get("index")
+
+        # 从状态机查询事务执行结果 (状态机 _do_txn 已按 log_index 缓存)
+        txn_result = self.kv.get_txn_result(log_index)
+        if txn_result is not None:
+            succeeded, info = txn_result
+            return Response(
+                ErrorCode.OK, "ok",
+                succeeded=succeeded,
+                revision=self.kv.revision,
+                failed_comparison=info.get("failed_comparison"),
+                log_index=log_index,
+            )
+
+        # Fallback: 如果没拿到缓存 (极罕见), 用 precheck 结果 (Leader 本地的)
+        return Response(
+            ErrorCode.OK, "ok",
+            succeeded=precheck_succeeded,
+            revision=self.kv.revision,
+            failed_comparison=precheck_info.get("failed_comparison"),
+            log_index=log_index,
+        )
+
+    def compare_and_put(
+        self,
+        key: str,
+        expected_version: int,
+        new_value: Any,
+        lease_id: int = 0,
+    ) -> Response:
+        """
+        Compare-And-Put: 当 key.version == expected_version 时, 写入 new_value
+
+        典型用法: 配置更新、CAS 计数器
+        返回: succeeded=True 表示写入成功
+        """
+        txn = TxnRequest(
+            comparisons=[TxnCompare(key=key, op=TxnCompareOp.VERSION_EQUAL, value=expected_version)],
+            success_ops=[TxnOp(op_type=TxnOpType.PUT, key=key, value=new_value, lease_id=lease_id)],
+            failure_ops=[TxnOp(op_type=TxnOpType.GET, key=key)],
+        )
+        return self.txn(txn)
+
+    def compare_and_delete(self, key: str, expected_version: int) -> Response:
+        """
+        Compare-And-Delete: 当 key.version == expected_version 时, 删除该键
+
+        典型用法: 安全删除配置
+        """
+        txn = TxnRequest(
+            comparisons=[TxnCompare(key=key, op=TxnCompareOp.VERSION_EQUAL, value=expected_version)],
+            success_ops=[TxnOp(op_type=TxnOpType.DELETE, key=key)],
+            failure_ops=[TxnOp(op_type=TxnOpType.GET, key=key)],
+        )
+        return self.txn(txn)
+
+    def compare_and_put_if_not_exists(
+        self,
+        key: str,
+        value: Any,
+        lease_id: int = 0,
+    ) -> Response:
+        """
+        Compare-And-Put-If-Not-Exists: 键不存在时才写入
+
+        典型用法: 配置抢占、选主注册
+        """
+        txn = TxnRequest(
+            comparisons=[TxnCompare(key=key, op=TxnCompareOp.KEY_NOT_EXISTS)],
+            success_ops=[TxnOp(op_type=TxnOpType.PUT, key=key, value=value, lease_id=lease_id)],
+            failure_ops=[TxnOp(op_type=TxnOpType.GET, key=key)],
+        )
+        return self.txn(txn)
 
     # ================================================================
     # 对外 API: 租约操作
@@ -410,6 +533,16 @@ class Node:
     def watch_list(self) -> Response:
         """列出所有 Watch"""
         return self.watch_mgr.list_watches()
+
+    def watch_status(self) -> Response:
+        """获取 Watch 历史窗口状态"""
+        return Response(
+            ErrorCode.OK, "ok",
+            compact_revision=self.watch_mgr.compact_revision,
+            head_revision=self.watch_mgr.head_revision,
+            history_size=self.watch_mgr._history_size,
+            history_count=len(self.watch_mgr._history),
+        )
 
     # ================================================================
     # 对外 API: 锁操作

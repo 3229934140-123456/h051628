@@ -16,7 +16,10 @@ import threading
 import time
 import logging
 
-from common import Response, ErrorCode, WatchEvent, WatchEventType, generate_id
+from common import (
+    Response, ErrorCode, WatchEvent, WatchEventType, generate_id,
+    TxnRequest, TxnCompare, TxnCompareOp, TxnOp, TxnOpType,
+)
 from node import Node, ClusterSimulator
 
 logger = logging.getLogger(__name__)
@@ -137,58 +140,314 @@ class DistributedLock:
 
 class Watcher:
     """
-    Watch 事件迭代器
+    Watch 事件迭代器 - 支持断线可恢复消费
+
+    关键特性:
+    1. 自动记录 last_revision: 消费到的最新事件 revision
+    2. 断线重连: 如果 Watch 失效 (watch_id 不存在), 自动用 last_revision 重新订阅
+    3. 超龄提示: 如果 last_revision 太旧, 会抛出 WatchCompactedException
+    4. last_revision 可通过 checkpoint() 保存, 用于进程重启后恢复
 
     用法:
-        with client.watch_prefix("my/key/") as watcher:
-            for event in watcher:
-                print(f"事件: {event.event_type} {event.key}")
+        # 初始订阅 (不重放历史)
+        watcher = client.watch_prefix("app/config/")
+        for event in watcher:
+            print(event)
+            # 定期 checkpoint, 进程重启时可恢复
+            # watcher.checkpoint()
+
+        # 断线恢复: 用上次保存的 revision 重新创建
+        watcher = client.watch_prefix("app/config/", start_revision=saved_rev)
     """
 
-    def __init__(self, client: "DistributedClient", watch_id: int):
+    def __init__(
+        self,
+        client: "DistributedClient",
+        watch_id: int,
+        start_revision: int = 0,
+        watch_params: Dict[str, Any] = None,
+        historical_events: Optional[List[WatchEvent]] = None,
+    ):
         self._client = client
         self.watch_id = watch_id
+        self._start_revision = start_revision
+        self._last_revision = start_revision  # 消费到的最新 revision
         self._cancelled = False
+        self._params = watch_params or {}
+        self._compact_revision = 0
+        self._head_revision = 0
+        self._error_count = 0
+        # create_watch 返回的立即历史事件, 在迭代器里优先消费
+        self._pending_historical: List[WatchEvent] = list(historical_events or [])
+
+    @property
+    def last_revision(self) -> int:
+        """当前消费到的最新 revision,可用于断线恢复"""
+        return self._last_revision
+
+    @property
+    def compact_revision(self) -> int:
+        """服务端历史窗口的最早 revision"""
+        return self._compact_revision
+
+    @property
+    def head_revision(self) -> int:
+        """服务端最新 revision"""
+        return self._head_revision
+
+    def checkpoint(self) -> int:
+        """手动 checkpoint, 返回当前 last_revision"""
+        return self._last_revision
+
+    def _reconnect(self) -> bool:
+        """
+        Watch 失效时重新订阅 (用 last_revision 恢复)
+
+        Returns:
+            True: 重连成功
+            False: 重连失败 (如历史超龄)
+
+        Raises:
+            WatchCompactedException: last_revision 超出历史窗口
+        """
+        logger.info(
+            f"[客户端 Watch] 尝试恢复订阅, start_revision={self._last_revision}"
+        )
+        resp = self._client._call_any(
+            "watch_create",
+            start_revision=self._last_revision,
+            **self._params,
+        )
+
+        if not resp.success:
+            if resp.code == ErrorCode.TIMEOUT:
+                # 历史超龄
+                compact_rev = resp.data.get("compact_revision", 0)
+                lost = resp.data.get("lost_events", 0)
+                raise WatchCompactedException(
+                    self._last_revision,
+                    compact_rev,
+                    lost,
+                    f"Watch 历史已丢失: 请求 rev={self._last_revision}, "
+                    f"但服务端仅保留 rev≥{compact_rev}, 丢失了约 {lost} 条事件"
+                )
+            logger.warning(f"[客户端 Watch] 重连失败: {resp.message}")
+            return False
+
+        # 更新状态
+        self.watch_id = resp.data["watch_id"]
+        self._compact_revision = resp.data.get("compact_revision", 0)
+        self._head_revision = resp.data.get("head_revision", 0)
+        self._error_count = 0
+
+        # 处理重放的历史事件
+        historical = self._client._parse_events_from_response(resp)
+        if historical:
+            self._pending_historical.extend(historical)
+            logger.info(
+                f"[客户端 Watch] 恢复成功,重放 {len(historical)} 条历史事件 "
+                f"(rev={self._last_revision})"
+            )
+
+        return True
 
     def __iter__(self) -> Iterator[WatchEvent]:
+        # 先消费 create_watch 立即返回的历史事件
+        while self._pending_historical and not self._cancelled:
+            ev = self._pending_historical.pop(0)
+            if ev.revision > self._last_revision:
+                self._last_revision = ev.revision
+            yield ev
+
         while not self._cancelled:
-            resp = self._client._call_any(
-                "watch_fetch",
-                self.watch_id,
-                max_count=100,
-                timeout=1.0,
-            )
-            if not resp.success:
-                logger.warning(f"[客户端] Watch 拉取失败: {resp.message}")
-                time.sleep(0.5)
-                continue
+            try:
+                resp = self._client._call_any(
+                    "watch_fetch",
+                    self.watch_id,
+                    max_count=100,
+                    timeout=1.0,
+                )
 
-            for ed in resp.data.get("events", []):
-                try:
-                    yield WatchEvent(
-                        event_type=WatchEventType(ed["event_type"]),
-                        key=ed["key"],
-                        value=ed.get("value"),
-                        revision=ed.get("revision", 0),
-                        lease_id=ed.get("lease_id", 0),
-                    )
-                except Exception as e:
-                    logger.warning(f"[客户端] 解析 Watch 事件失败: {e}")
+                # Watch 不存在或失效, 尝试重连
+                if not resp.success and resp.code == ErrorCode.KEY_NOT_FOUND:
+                    self._error_count += 1
+                    if self._error_count >= 3:
+                        logger.error("[客户端 Watch] 多次失败,尝试重连...")
+                        self._reconnect()
+                    else:
+                        time.sleep(0.2)
+                    continue
 
-            if resp.data.get("has_more"):
-                continue
+                if not resp.success:
+                    logger.warning(f"[客户端 Watch] 拉取失败: {resp.message}")
+                    time.sleep(0.5)
+                    continue
+
+                self._error_count = 0
+                self._compact_revision = resp.data.get("compact_revision", 0)
+                self._head_revision = resp.data.get("head_revision", 0)
+
+                events = resp.data.get("events", [])
+                for ed in events:
+                    try:
+                        ev = WatchEvent(
+                            event_type=WatchEventType(ed["event_type"]),
+                            key=ed["key"],
+                            value=ed.get("value"),
+                            revision=ed.get("revision", 0),
+                            lease_id=ed.get("lease_id", 0),
+                        )
+                        # 更新消费进度
+                        if ev.revision > self._last_revision:
+                            self._last_revision = ev.revision
+                        yield ev
+                    except Exception as e:
+                        logger.warning(f"[客户端 Watch] 解析事件失败: {e}")
+
+                # has_more 立即继续拉
+                if resp.data.get("has_more"):
+                    continue
+
+            except WatchCompactedException:
+                # 历史超龄, 不捕获, 让调用者处理
+                raise
+            except Exception as e:
+                self._error_count += 1
+                logger.warning(f"[客户端 Watch] 迭代异常: {e}")
+                if self._error_count >= 5:
+                    logger.error("[客户端 Watch] 异常过多,尝试重连...")
+                    try:
+                        self._reconnect()
+                    except WatchCompactedException:
+                        raise
+                    time.sleep(0.5)
+                else:
+                    time.sleep(0.2)
 
     def cancel(self):
         if not self._cancelled:
             self._cancelled = True
-            self._client._call_any("watch_cancel", self.watch_id)
+            try:
+                self._client._call_any("watch_cancel", self.watch_id)
+            except:
+                pass
+
+    def collect(
+        self,
+        timeout: float = 2.0,
+        max_events: int = 100,
+    ) -> List[WatchEvent]:
+        """
+        在 timeout 秒内收集最多 max_events 个事件后返回。
+
+        特性:
+        - 先消费立即可用的历史事件 (create_watch/_reconnect 带过来的)
+        - 然后最多等待 timeout 秒, 有新事件就立即返回
+        - 如果没有任何事件 (历史+实时都为空), 会一直等到 timeout
+        """
+        events: List[WatchEvent] = []
+        deadline = time.time() + timeout
+
+        # 1) 先吃掉 pending_historical
+        while self._pending_historical and not self._cancelled and len(events) < max_events:
+            ev = self._pending_historical.pop(0)
+            if ev.revision > self._last_revision:
+                self._last_revision = ev.revision
+            events.append(ev)
+
+        # 2) 进入长轮询收集实时事件
+        remaining = deadline - time.time()
+        while not self._cancelled and len(events) < max_events and remaining > 0:
+            try:
+                resp = self._client._call_any(
+                    "watch_fetch",
+                    self.watch_id,
+                    max_count=max_events - len(events),
+                    timeout=min(remaining, 1.0),
+                )
+
+                if not resp.success and resp.code == ErrorCode.KEY_NOT_FOUND:
+                    self._error_count += 1
+                    if self._error_count >= 3:
+                        logger.error("[客户端 Watch] collect 多次失败,尝试重连...")
+                        self._reconnect()
+                    else:
+                        time.sleep(0.1)
+                    remaining = deadline - time.time()
+                    continue
+
+                if not resp.success:
+                    logger.warning(f"[客户端 Watch] collect 拉取失败: {resp.message}")
+                    time.sleep(0.2)
+                    remaining = deadline - time.time()
+                    continue
+
+                self._error_count = 0
+                self._compact_revision = resp.data.get("compact_revision", 0)
+                self._head_revision = resp.data.get("head_revision", 0)
+
+                ev_list = resp.data.get("events", [])
+                for ed in ev_list:
+                    try:
+                        ev = WatchEvent(
+                            event_type=WatchEventType(ed["event_type"]),
+                            key=ed["key"],
+                            value=ed.get("value"),
+                            revision=ed.get("revision", 0),
+                            lease_id=ed.get("lease_id", 0),
+                        )
+                        if ev.revision > self._last_revision:
+                            self._last_revision = ev.revision
+                        events.append(ev)
+                        if len(events) >= max_events:
+                            break
+                    except Exception as e:
+                        logger.warning(f"[客户端 Watch] collect 解析事件失败: {e}")
+
+                # 有事件就返回, 没事件继续等
+                if len(events) > 0 and not resp.data.get("has_more"):
+                    break
+                if len(events) >= max_events:
+                    break
+            except WatchCompactedException:
+                raise
+            except Exception as e:
+                self._error_count += 1
+                logger.warning(f"[客户端 Watch] collect 异常: {e}")
+                time.sleep(0.1)
+            remaining = deadline - time.time()
+
+        return events
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cancel()
+        # WatchCompactedException 不吞, 让调用者知道
+        if isinstance(exc_val, WatchCompactedException):
+            return False
         return False
+
+
+class WatchCompactedException(Exception):
+    """
+    Watch 历史已被压缩 (超龄) 异常
+
+    表示客户端请求的 start_revision 早于服务端保留的 compact_revision,
+    中间有事件已经丢失, 无法完整恢复。
+
+    处理方式:
+    1. 记录告警, 业务层可能需要全量同步
+    2. 用 compact_revision 重新创建 Watch (从当前可用历史开始)
+    """
+
+    def __init__(self, requested_revision: int, compact_revision: int,
+                 lost_events: int, message: str):
+        super().__init__(message)
+        self.requested_revision = requested_revision
+        self.compact_revision = compact_revision
+        self.lost_events = lost_events
 
 
 class DistributedClient:
@@ -359,6 +618,53 @@ class DistributedClient:
     def get_all(self) -> Response:
         return self._call_any("kv_get_all")
 
+    # ======== 事务 (CAS) API ========
+
+    def txn(self, txn_request: TxnRequest) -> Response:
+        """执行事务: IF comparisons THEN success_ops ELSE failure_ops"""
+        return self._call_leader("txn", txn_request)
+
+    def compare_and_put(
+        self,
+        key: str,
+        expected_version: int,
+        new_value: Any,
+        lease_id: int = 0,
+    ) -> Response:
+        """
+        Compare-And-Put (CAS): 当 key.version == expected_version 时才写入 new_value
+
+        返回: resp.succeeded = True 表示写入成功
+        """
+        return self._call_leader("compare_and_put", key, expected_version, new_value, lease_id)
+
+    def compare_and_delete(self, key: str, expected_version: int) -> Response:
+        """
+        Compare-And-Delete: 当 key.version == expected_version 时才删除
+
+        返回: resp.succeeded = True 表示删除成功
+        """
+        return self._call_leader("compare_and_delete", key, expected_version)
+
+    def compare_and_put_if_not_exists(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[int] = None,
+    ) -> Response:
+        """
+        Compare-And-Put-If-Not-Exists: 键不存在时才写入
+
+        典型用法: 配置抢占、选主注册
+        返回: resp.succeeded = True 表示写入成功
+        """
+        lease_id = 0
+        if ttl and ttl > 0:
+            resp = self._call_leader("lease_grant", ttl, self.session_id)
+            if resp.success:
+                lease_id = resp.data["lease_id"]
+        return self._call_leader("compare_and_put_if_not_exists", key, value, lease_id)
+
     # ======== 租约 API ========
 
     def grant_lease(self, ttl: int) -> Response:
@@ -392,15 +698,32 @@ class DistributedClient:
         key: str,
         start_revision: int = 0,
     ) -> Watcher:
-        """Watch 单个键"""
+        """Watch 单个键, 支持断线恢复"""
+        params = {"exact_key": key}
         resp = self._call_any(
             "watch_create",
             exact_key=key,
             start_revision=start_revision,
         )
         if not resp.success:
+            if resp.code == ErrorCode.TIMEOUT:
+                raise WatchCompactedException(
+                    start_revision,
+                    resp.data.get("compact_revision", 0),
+                    resp.data.get("lost_events", 0),
+                    resp.message,
+                )
             raise RuntimeError(f"创建 Watch 失败: {resp.message}")
-        watcher = Watcher(self, resp.data["watch_id"])
+
+        # 解析 create_watch 返回的历史事件
+        historical = self._parse_events_from_response(resp)
+
+        watcher = Watcher(
+            self, resp.data["watch_id"],
+            start_revision=start_revision,
+            watch_params=params,
+            historical_events=historical,
+        )
         self._watchers[watcher.watch_id] = watcher
         return watcher
 
@@ -409,17 +732,55 @@ class DistributedClient:
         prefix: str,
         start_revision: int = 0,
     ) -> Watcher:
-        """Watch 前缀"""
+        """Watch 前缀, 支持断线恢复"""
+        params = {"prefix": prefix}
         resp = self._call_any(
             "watch_create",
             prefix=prefix,
             start_revision=start_revision,
         )
         if not resp.success:
+            if resp.code == ErrorCode.TIMEOUT:
+                raise WatchCompactedException(
+                    start_revision,
+                    resp.data.get("compact_revision", 0),
+                    resp.data.get("lost_events", 0),
+                    resp.message,
+                )
             raise RuntimeError(f"创建 Watch 失败: {resp.message}")
-        watcher = Watcher(self, resp.data["watch_id"])
+
+        # 解析 create_watch 返回的历史事件
+        historical = self._parse_events_from_response(resp)
+
+        watcher = Watcher(
+            self, resp.data["watch_id"],
+            start_revision=start_revision,
+            watch_params=params,
+            historical_events=historical,
+        )
         self._watchers[watcher.watch_id] = watcher
         return watcher
+
+    def _parse_events_from_response(self, resp) -> List[WatchEvent]:
+        """把 response data['events'] 解析成 WatchEvent 列表"""
+        events: List[WatchEvent] = []
+        for ed in resp.data.get("events", []) or []:
+            try:
+                events.append(WatchEvent(
+                    event_type=WatchEventType(ed["event_type"]),
+                    key=ed["key"],
+                    value=ed.get("value"),
+                    revision=ed.get("revision", 0),
+                    lease_id=ed.get("lease_id", 0),
+                ))
+            except Exception as e:
+                logger.warning(f"[客户端 Watch] 解析历史事件失败: {e}")
+        return events
+
+    def watch_status(self) -> Dict[str, Any]:
+        """获取 Watch 历史窗口状态"""
+        resp = self._call_any("watch_status")
+        return resp.data
 
     # ======== 状态查询 ========
 

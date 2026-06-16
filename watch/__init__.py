@@ -126,12 +126,15 @@ class WatchManager:
     1. 实时推送: 状态机变更时立即推送到 Watcher 队列
     2. 历史重放: 客户端断线重连时,指定 start_revision,从历史事件中重放
     3. 事件历史: 环形缓冲区保存最近 N 条事件,供滞后的客户端重放
+    4. 超龄检测: 如果 start_revision < compact_revision,返回明确错误提示
 
     典型使用流程:
     1. client: watch(key, start_revision=0)  →  先重放历史,再等新事件
     2. 服务器: 从历史事件中查找 revision > start_revision 且匹配的事件
-    3. 服务器: 匹配的事件立即返回
+    3. 服务器: 匹配的事件立即返回 (带 compact_revision 和 head_revision)
     4. 服务器: 注册 Watcher,后续匹配事件实时推送
+    5. client: 处理完事件后,记录最后一次的 revision
+    6. client: 断线重连时用 last_revision 作为 start_revision,保证不丢事件
     """
 
     def __init__(self, history_size: int = 100000):
@@ -146,6 +149,29 @@ class WatchManager:
         # 索引: key -> [(revision, event_idx), ...]
         # 用于加速按 key 查找历史事件 (可选优化)
         self._key_history_index: Dict[str, List[int]] = {}
+
+    # ======== 属性 ========
+
+    @property
+    def compact_revision(self) -> int:
+        """
+        当前历史缓冲区内可重放的最早 revision
+        客户端 start_revision 如果小于这个值,说明部分历史已经丢失
+        """
+        with self._lock:
+            if not self._history:
+                return 0
+            return self._history[0][0] - 1
+
+    @property
+    def head_revision(self) -> int:
+        """
+        当前历史缓冲区内最新的 revision
+        """
+        with self._lock:
+            if not self._history:
+                return 0
+            return self._history[-1][0]
 
     # ======== 状态机变更回调: 写入历史 + 推送给 Watcher ========
 
@@ -195,16 +221,47 @@ class WatchManager:
         filters: Optional[Dict[str, Any]] = None,
     ) -> Response:
         """
-        创建 Watch 订阅
+        创建 Watch 订阅 (支持可恢复消费)
 
         Args:
             start_revision: 从哪个 revision 开始 (含)
-                          - 0: 不重放历史,只看未来事件
-                          - N: 重放 revision > N 的所有历史事件,再订阅未来事件
+                          - -1: 不重放历史,只看未来事件
+                          - 0:  从当前最新 revision 开始 (未来事件)
+                          - N>0: 重放 revision > N 的所有历史事件,再订阅未来事件
 
-        返回: watch_id + 初始历史事件 (如果有)
+        返回:
+            - success=True:
+                watch_id, events(历史事件), events_count
+                compact_revision (当前历史保留的最早 revision)
+                head_revision (当前最新 revision)
+                more_history (是否还有更多历史未返回)
+            - success=False, code=TIMEOUT:
+                start_revision 太旧,部分历史已丢失
+                compact_revision (从这个 revision 开始才有历史)
         """
         with self._lock:
+            compact_rev = self.compact_revision
+            head_rev = self.head_revision
+
+            # 超龄检测: 只有当 start_revision > 0 时才检测
+            if start_revision > 0 and start_revision < compact_rev:
+                logger.warning(
+                    f"[Watch] start_revision={start_revision} 超龄! "
+                    f"历史仅保留 compact_revision={compact_rev} 之后的事件"
+                )
+                return Response(
+                    ErrorCode.TIMEOUT,
+                    f"部分历史已丢失: 请求 revision={start_revision}, "
+                    f"但历史仅从 compact_revision={compact_rev} 开始",
+                    compact_revision=compact_rev,
+                    head_revision=head_rev,
+                    start_revision=start_revision,
+                    lost_events=compact_rev - start_revision,
+                    watch_id=0,
+                    events=[],
+                    events_count=0,
+                )
+
             matcher = WatchMatcher(
                 exact_key=exact_key,
                 prefix=prefix,
@@ -229,7 +286,8 @@ class WatchManager:
 
             # 重放历史事件 (revision > start_revision)
             historical_events = []
-            if start_revision >= 0:
+            more_history = False
+            if start_revision >= 0 and self._history:
                 for hist_rev, hist_event in self._history:
                     if hist_rev <= start_revision:
                         continue
@@ -239,7 +297,8 @@ class WatchManager:
 
             logger.info(
                 f"[Watch] 创建 watch_id={watch_id}, 条件=[{matcher.description()}], "
-                f"start_rev={start_revision}, 历史事件={len(historical_events)}条"
+                f"start_rev={start_revision}, 历史={len(historical_events)}条, "
+                f"compact={compact_rev}, head={head_rev}"
             )
 
             return Response(
@@ -248,6 +307,9 @@ class WatchManager:
                 events=historical_events,
                 events_count=len(historical_events),
                 matcher=matcher.description(),
+                compact_revision=compact_rev,
+                head_revision=head_rev,
+                more_history=more_history,
             )
 
     def cancel_watch(self, watch_id: int) -> Response:
@@ -277,14 +339,35 @@ class WatchManager:
             timeout: 0 = 非阻塞,立即返回 (可能为空)
                      >0 = 最多等待 timeout 秒,有事件就返回
 
+        返回:
+            events: 本次拉取的事件列表
+            events_count: 事件数量
+            has_more: 是否还有更多事件未返回
+            compact_revision: 历史窗口起始 revision (用于断线恢复)
+            head_revision: 当前最新 revision
+            last_revision: 本次返回事件中的最大 revision
+
         也可以用回调模式 (见 add_callback_watch)
         """
         with self._lock:
             watcher = self._watchers.get(watch_id)
+            compact_rev = self.compact_revision
+            head_rev = self.head_revision
+
         if not watcher:
-            return Response(ErrorCode.KEY_NOT_FOUND, f"Watch 不存在: {watch_id}")
+            return Response(
+                ErrorCode.KEY_NOT_FOUND,
+                f"Watch 不存在: {watch_id}",
+                compact_revision=compact_rev,
+                head_revision=head_rev,
+            )
 
         events = watcher.pop_events(max_count=max_count, timeout=timeout)
+
+        last_revision = watcher.start_revision
+        for ev in events:
+            if ev.revision > last_revision:
+                last_revision = ev.revision
 
         return Response(
             ErrorCode.OK, "ok",
@@ -292,6 +375,9 @@ class WatchManager:
             events=[e.to_dict() for e in events],
             events_count=len(events),
             has_more=len(watcher.queue) > 0,
+            compact_revision=compact_rev,
+            head_revision=head_rev,
+            last_revision=last_revision,
         )
 
     # ======== 回调模式 (更高效的推送) ========
