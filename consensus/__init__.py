@@ -109,6 +109,7 @@ class ConsensusModule:
         self.role: NodeRole = NodeRole.FOLLOWER
         self.leader_id: Optional[str] = None
         self.election_deadline: float = 0.0
+        self._paused: bool = False
 
         # 集群信息
         self.peers: Dict[str, PeerNode] = {}
@@ -272,6 +273,9 @@ class ConsensusModule:
 
     def _apply_committed_logs(self):
         """将 [last_applied+1, commit_index] 区间的日志应用到状态机"""
+        if getattr(self, '_paused', False):
+            return
+
         with self._lock:
             if self.commit_index <= self.last_applied:
                 return

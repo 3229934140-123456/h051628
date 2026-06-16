@@ -730,13 +730,17 @@ class DistributedClient:
         self,
         key: str,
         start_revision: int = 0,
+        event_types: Optional[List[WatchEventType]] = None,
     ) -> Watcher:
-        """Watch 单个键, 支持断线恢复"""
+        """Watch 单个键, 支持断线恢复和事件类型过滤"""
         params = {"exact_key": key}
+        if event_types:
+            params["event_types"] = [et.value for et in event_types]
         resp = self._call_any(
             "watch_create",
             exact_key=key,
             start_revision=start_revision,
+            event_types=[et.value for et in event_types] if event_types else None,
         )
         if not resp.success:
             if resp.code == ErrorCode.TIMEOUT:
@@ -769,13 +773,17 @@ class DistributedClient:
         self,
         prefix: str,
         start_revision: int = 0,
+        event_types: Optional[List[WatchEventType]] = None,
     ) -> Watcher:
-        """Watch 前缀, 支持断线恢复"""
+        """Watch 前缀, 支持断线恢复和事件类型过滤"""
         params = {"prefix": prefix}
+        if event_types:
+            params["event_types"] = [et.value for et in event_types]
         resp = self._call_any(
             "watch_create",
             prefix=prefix,
             start_revision=start_revision,
+            event_types=[et.value for et in event_types] if event_types else None,
         )
         if not resp.success:
             if resp.code == ErrorCode.TIMEOUT:
