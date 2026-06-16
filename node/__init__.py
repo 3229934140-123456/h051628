@@ -64,7 +64,8 @@ class Node:
         self,
         node_id: str,
         peers: List[Tuple[str, str]],
-        raft_config: RaftConfig = None,
+        raft_config: Optional[RaftConfig] = None,
+        watch_history_size: int = 100000,
     ):
         self.node_id = node_id
         self.raft_config = raft_config or RaftConfig()
@@ -76,7 +77,7 @@ class Node:
         # ===== 初始化子模块 =====
         self.kv = KVStateMachine()
         self.lease_mgr = LeaseManager(kv_state_machine=self.kv)
-        self.watch_mgr = WatchManager()
+        self.watch_mgr = WatchManager(history_size=watch_history_size)
         self.lock_svc = LockService(
             kv_state_machine=self.kv,
             lease_manager=self.lease_mgr,
@@ -369,6 +370,8 @@ class Node:
                 succeeded=succeeded,
                 revision=self.kv.revision,
                 failed_comparison=info.get("failed_comparison"),
+                op_results=info.get("op_results", []),
+                ops_executed=info.get("ops_executed", 0),
                 log_index=log_index,
             )
 
@@ -429,6 +432,32 @@ class Node:
             comparisons=[TxnCompare(key=key, op=TxnCompareOp.KEY_NOT_EXISTS)],
             success_ops=[TxnOp(op_type=TxnOpType.PUT, key=key, value=value, lease_id=lease_id)],
             failure_ops=[TxnOp(op_type=TxnOpType.GET, key=key)],
+        )
+        return self.txn(txn)
+
+    def batch_txn(
+        self,
+        comparisons: List[TxnCompare],
+        success_ops: List[TxnOp],
+        failure_ops: Optional[List[TxnOp]] = None,
+    ) -> Response:
+        """
+        批量事务: 一次 compare 后执行多条 put/delete
+
+        典型用法:
+        - 配置批量发布: Compare(version_equal) + [Put(k1,v1), Put(k2,v2), ...]
+        - 锁续租校验: Compare(value_equal) + [Put(...), ...]
+        - 原子回滚: Compare(...) + [Delete(k1), Delete(k2), ...]
+
+        返回:
+            succeeded: 条件是否满足
+            op_results: 每个操作的执行结果摘要 [{"op":"put","key":"k","success":True}, ...]
+            revision: 当前 revision
+        """
+        txn = TxnRequest(
+            comparisons=comparisons,
+            success_ops=success_ops,
+            failure_ops=failure_ops or [],
         )
         return self.txn(txn)
 
@@ -627,6 +656,46 @@ class Node:
             "locks": self.lock_svc.list_locks().data.get("count", 0),
             "stats": self._stats.copy(),
         }
+
+    def kv_snapshot(self, prefix: str = "") -> Dict[str, Any]:
+        """
+        返回 KV 快照摘要, 用于一致性对比
+
+        返回:
+            revision: 当前 revision
+            key_count: 键数量 (可按 prefix 过滤)
+            keys: {key: {value, version, mod_revision, lease_id}} 字典
+        """
+        all_resp = self.kv.get_all()
+        items = all_resp.data.get("items", []) if all_resp.success else []
+        keys = {}
+        for it in items:
+            if isinstance(it, dict):
+                k = it.get("key", "")
+            else:
+                k = it.key if hasattr(it, "key") else str(it)
+            if prefix and not k.startswith(prefix):
+                continue
+            if isinstance(it, dict):
+                keys[k] = {
+                    "value": it.get("value"),
+                    "version": it.get("version", 0),
+                    "mod_revision": it.get("mod_revision", 0),
+                    "lease_id": it.get("lease_id", 0),
+                }
+            elif hasattr(it, "value"):
+                keys[k] = {
+                    "value": it.value,
+                    "version": it.version,
+                    "mod_revision": it.mod_revision,
+                    "lease_id": it.lease_id,
+                }
+        return {
+            "revision": self.kv.revision,
+            "key_count": len(keys),
+            "keys": keys,
+        }
+
 
     def dump_debug(self) -> Dict[str, Any]:
         """调试信息"""

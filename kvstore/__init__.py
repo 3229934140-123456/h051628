@@ -195,11 +195,12 @@ class KVStateMachine:
         """执行事务: 先评估条件, 然后执行对应分支 (必须在锁内)"""
         succeeded, info = self._eval_comparisons(txn.comparisons)
         ops_to_exec = txn.success_ops if succeeded else txn.failure_ops
-        results = []
+        op_results = []
         for op in ops_to_exec:
             result = self._exec_single_op(op, revision, log_index)
-            results.append(result)
-        # 缓存结果供 txn() 接口查询
+            op_results.append(result)
+        info["op_results"] = op_results
+        info["ops_executed"] = len(ops_to_exec)
         self._txn_results[log_index] = (succeeded, info)
         if len(self._txn_results) > self._max_txn_results:
             self._txn_results.popitem(last=False)
@@ -207,7 +208,8 @@ class KVStateMachine:
             f"[状态机] 事务执行(log_index={log_index}): succeeded={succeeded}, "
             f"执行了 {len(ops_to_exec)} 个操作"
         )
-        return succeeded, results
+        return succeeded, op_results
+
 
     def get_txn_result(self, log_index: int) -> Optional[Tuple[bool, Dict[str, Any]]]:
         """查询指定 log_index 的事务执行结果"""

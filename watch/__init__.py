@@ -243,11 +243,13 @@ class WatchManager:
             compact_rev = self.compact_revision
             head_rev = self.head_revision
 
-            # 超龄检测: 只有当 start_revision > 0 时才检测
+            # 超龄检测: start_revision > 0 且早于 compact_revision
             if start_revision > 0 and start_revision < compact_rev:
+                lost = compact_rev - start_revision
                 logger.warning(
                     f"[Watch] start_revision={start_revision} 超龄! "
-                    f"历史仅保留 compact_revision={compact_rev} 之后的事件"
+                    f"历史仅保留 compact_revision={compact_rev} 之后的事件, "
+                    f"约 {lost} 条已丢失"
                 )
                 return Response(
                     ErrorCode.TIMEOUT,
@@ -256,7 +258,9 @@ class WatchManager:
                     compact_revision=compact_rev,
                     head_revision=head_rev,
                     start_revision=start_revision,
-                    lost_events=compact_rev - start_revision,
+                    lost_events=lost,
+                    suggest_resync_revision=compact_rev,
+                    window_size=head_rev - compact_rev,
                     watch_id=0,
                     events=[],
                     events_count=0,
@@ -309,6 +313,7 @@ class WatchManager:
                 matcher=matcher.description(),
                 compact_revision=compact_rev,
                 head_revision=head_rev,
+                window_size=head_rev - compact_rev,
                 more_history=more_history,
             )
 

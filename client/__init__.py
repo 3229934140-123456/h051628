@@ -229,7 +229,10 @@ class Watcher:
                     compact_rev,
                     lost,
                     f"Watch 历史已丢失: 请求 rev={self._last_revision}, "
-                    f"但服务端仅保留 rev≥{compact_rev}, 丢失了约 {lost} 条事件"
+                    f"但服务端仅保留 rev≥{compact_rev}, 丢失了约 {lost} 条事件",
+                    suggest_resync_revision=resp.data.get("suggest_resync_revision", compact_rev),
+                    window_size=resp.data.get("window_size", 0),
+                    head_revision=resp.data.get("head_revision", 0),
                 )
             logger.warning(f"[客户端 Watch] 重连失败: {resp.message}")
             return False
@@ -437,17 +440,31 @@ class WatchCompactedException(Exception):
     表示客户端请求的 start_revision 早于服务端保留的 compact_revision,
     中间有事件已经丢失, 无法完整恢复。
 
+    属性:
+    - requested_revision: 客户端请求的起始 revision
+    - compact_revision:   服务端当前可用的最早 revision
+    - lost_events:        请求 revision 和 compact_revision 之间丢失的事件数
+    - suggest_resync_revision: 建议从此 revision 开始做全量同步
+    - window_size:        服务端当前历史窗口大小 (head - compact)
+    - head_revision:      服务端最新 revision
+
     处理方式:
     1. 记录告警, 业务层可能需要全量同步
-    2. 用 compact_revision 重新创建 Watch (从当前可用历史开始)
+    2. 用 suggest_resync_revision 重新创建 Watch (从当前可用历史开始)
     """
 
     def __init__(self, requested_revision: int, compact_revision: int,
-                 lost_events: int, message: str):
+                 lost_events: int, message: str,
+                 suggest_resync_revision: int = 0,
+                 window_size: int = 0,
+                 head_revision: int = 0):
         super().__init__(message)
         self.requested_revision = requested_revision
         self.compact_revision = compact_revision
         self.lost_events = lost_events
+        self.suggest_resync_revision = suggest_resync_revision or compact_revision
+        self.window_size = window_size
+        self.head_revision = head_revision
 
 
 class DistributedClient:
@@ -665,6 +682,22 @@ class DistributedClient:
                 lease_id = resp.data["lease_id"]
         return self._call_leader("compare_and_put_if_not_exists", key, value, lease_id)
 
+    def batch_txn(
+        self,
+        comparisons: List[TxnCompare],
+        success_ops: List[TxnOp],
+        failure_ops: Optional[List[TxnOp]] = None,
+    ) -> Response:
+        """
+        批量事务: 一次 compare 后执行多条 put/delete
+
+        返回:
+            succeeded: 条件是否满足
+            op_results: 每个操作结果 [{"op":"put","key":"k","success":True}, ...]
+            revision: 当前 revision
+        """
+        return self._call_leader("batch_txn", comparisons, success_ops, failure_ops or [])
+
     # ======== 租约 API ========
 
     def grant_lease(self, ttl: int) -> Response:
@@ -712,6 +745,9 @@ class DistributedClient:
                     resp.data.get("compact_revision", 0),
                     resp.data.get("lost_events", 0),
                     resp.message,
+                    suggest_resync_revision=resp.data.get("suggest_resync_revision", 0),
+                    window_size=resp.data.get("window_size", 0),
+                    head_revision=resp.data.get("head_revision", 0),
                 )
             raise RuntimeError(f"创建 Watch 失败: {resp.message}")
 
@@ -724,6 +760,8 @@ class DistributedClient:
             watch_params=params,
             historical_events=historical,
         )
+        watcher._compact_revision = resp.data.get("compact_revision", 0)
+        watcher._head_revision = resp.data.get("head_revision", 0)
         self._watchers[watcher.watch_id] = watcher
         return watcher
 
@@ -746,6 +784,9 @@ class DistributedClient:
                     resp.data.get("compact_revision", 0),
                     resp.data.get("lost_events", 0),
                     resp.message,
+                    suggest_resync_revision=resp.data.get("suggest_resync_revision", 0),
+                    window_size=resp.data.get("window_size", 0),
+                    head_revision=resp.data.get("head_revision", 0),
                 )
             raise RuntimeError(f"创建 Watch 失败: {resp.message}")
 
@@ -758,6 +799,8 @@ class DistributedClient:
             watch_params=params,
             historical_events=historical,
         )
+        watcher._compact_revision = resp.data.get("compact_revision", 0)
+        watcher._head_revision = resp.data.get("head_revision", 0)
         self._watchers[watcher.watch_id] = watcher
         return watcher
 
